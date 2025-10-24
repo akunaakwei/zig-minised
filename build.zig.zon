@@ -1,0 +1,17 @@
+.{
+    .name = .minised,
+    .version = "1.16.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .minised = .{
+            .url = "http://dl.exactcode.de/oss/minised/minised-1.16.tar.gz",
+            .hash = "N-V-__8AAKsoAQDtiTXrFhXFip245h-UKQb9_RD4y30IxuKP",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+    },
+    .fingerprint = 0x3c3831c6b030fdfd,
+}
