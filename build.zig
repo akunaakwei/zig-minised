@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    minised.addCSourceFiles(.{
+    minised.root_module.addCSourceFiles(.{
         .root = minised_dep.path("."),
         .files = &.{ "sedcomp.c", "sedexec.c" },
     });
@@ -62,36 +62,47 @@ const SedTestStep = struct {
     }
 
     fn runAllowFail(
-        b: *std.Build,
+        b: *Build,
         argv: []const []const u8,
         out_code: *u8,
-    ) ![]u8 {
+        stderr_behavior: std.process.SpawnOptions.StdIo,
+    ) std.Build.RunError![]u8 {
         if (!process.can_spawn)
             return error.ExecNotSupported;
 
+        const graph = b.graph;
+        const io = graph.io;
+
         const max_output_size = 400 * 1024;
-        var child = std.process.Child.init(argv, b.allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.env_map = &b.graph.env_map;
+        try Step.handleVerbose2(b, .inherit, &graph.environ_map, argv);
 
-        try Step.handleVerbose2(b, null, child.env_map, argv);
-        try child.spawn();
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .environ_map = &graph.environ_map,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = stderr_behavior,
+        });
 
-        var stdout: ArrayList(u8) = .empty;
-        var stderr: ArrayList(u8) = .empty;
-        errdefer stdout.deinit(b.allocator);
-        errdefer stderr.deinit(b.allocator);
+        var stdout_reader = child.stdout.?.readerStreaming(io, &.{});
+        const stdout = stdout_reader.interface.allocRemaining(b.allocator, .limited(max_output_size)) catch {
+            return error.ReadFailure;
+        };
+        errdefer b.allocator.free(stdout);
 
-        try child.collectOutput(b.allocator, &stdout, &stderr, max_output_size);
-        const term = try child.wait();
+        const term = try child.wait(io);
         switch (term) {
-            .Exited => |code| {
-                out_code.* = @as(u8, @truncate(code));
-                return stdout.items;
+            .exited => |code| {
+                if (code != 0) {
+                    out_code.* = @as(u8, @truncate(code));
+                }
+                return stdout;
             },
-            .Signal, .Stopped, .Unknown => |code| {
+            .signal, .stopped => |sig| {
+                out_code.* = @as(u8, @truncate(@intFromEnum(sig)));
+                return error.ProcessTerminated;
+            },
+            .unknown => |code| {
                 out_code.* = @as(u8, @truncate(code));
                 return error.ProcessTerminated;
             },
@@ -110,25 +121,53 @@ const SedTestStep = struct {
         const artifact_path = sed_test.artifact.getEmittedBin().getPath3(b, step);
 
         var exit_code: u8 = undefined;
-        const dirty_result = try runAllowFail(
-            b,
-            &.{ artifact_path.subPathOrDot(), "-f", sed_path, in_path },
-            &exit_code,
-        );
-        const out_file = root_path.openFile(b.fmt("{s}.out", .{sed_test.name}), .{}) catch |err| {
-            if (err == error.FileNotFound and exit_code != 0) {
-                // failed (as expected)
-                return;
-            } else if (err == error.FileNotFound and exit_code == 0) {
-                return step.fail("test {s} passed unexpectedly", .{sed_test.name});
-            } else {
-                return err;
-            }
+
+        const result = result: {
+            const dirty_result = try runAllowFail(
+                b,
+                &.{ artifact_path.subPathOrDot(), "-f", sed_path, in_path },
+                &exit_code,
+                .pipe,
+            );
+            break :result try std.mem.replaceOwned(u8, allocator, dirty_result, "\r\n", "\n");
         };
-        const out_content = try out_file.readToEndAlloc(allocator, 16 * 1024);
-        const result = try std.mem.replaceOwned(u8, allocator, dirty_result, "\r\n", "\n");
-        if (!std.mem.eql(u8, result, out_content)) {
-            return step.fail("test {s} failed\n\texpected `{s}` got `{s}`\n\tcmd: {s} -f {s} {s}", .{ sed_test.name, out_content, result, artifact_path.subPathOrDot(), sed_path, in_path });
+        defer allocator.free(result);
+
+        const expected = expected: {
+            const file = root_path.openFile(b.graph.io, b.fmt("{s}.out", .{sed_test.name}), .{}) catch |err| {
+                if (err == error.FileNotFound and exit_code != 0) {
+                    // failed (as expected)
+                    return;
+                } else if (err == error.FileNotFound and exit_code == 0) {
+                    return step.fail("test {s} passed unexpectedly", .{sed_test.name});
+                } else {
+                    return step.fail("test {s} unknown error", .{sed_test.name});
+                }
+            };
+            defer file.close(b.graph.io);
+
+            const size = size: {
+                const stat = try file.stat(b.graph.io);
+                break :size stat.size;
+            };
+
+            var buf: [1024 * 8]u8 = undefined;
+            var reader = file.reader(b.graph.io, &buf);
+            const content = try allocator.alloc(u8, size);
+            try reader.interface.readSliceAll(content);
+            break :expected content;
+        };
+        defer allocator.free(expected);
+
+        if (!std.mem.eql(u8, result, expected)) {
+            return step.fail("test {s} failed\n\texpected `{s}` got `{s}`\n\tcmd: {s} -f {s} {s}", .{
+                sed_test.name,
+                expected,
+                result,
+                artifact_path.subPathOrDot(),
+                sed_path,
+                in_path,
+            });
         }
     }
 };

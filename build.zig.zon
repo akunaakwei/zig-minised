@@ -1,7 +1,7 @@
 .{
     .name = .minised,
     .version = "1.16.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .minised = .{
             .url = "http://dl.exactcode.de/oss/minised/minised-1.16.tar.gz",
